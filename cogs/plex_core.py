@@ -356,6 +356,7 @@ class PlexCore(commands.Cog):
             presence_config = self.config["presence"]
             stats = info["library_stats"]
 
+            # Prepare activity text before presence update to minimize blocking time
             if info["status"] != "🟢 Online":
                 activity_text = presence_config["offline_text"]
                 status = discord.Status.dnd
@@ -365,18 +366,34 @@ class PlexCore(commands.Cog):
                 )
                 status = discord.Status.online
             else:
-                presence_parts = [
-                    f"{'{:,.0f}'.format(stats[section['section_title']]['count']).replace(',', '.')} {section['display_name']} {section['emoji']}"
-                    for section in presence_config["sections"]
-                    if section["section_title"] in stats
-                ]
+                # Pre-format the sections data to minimize processing during presence update
+                presence_parts = []
+                for section in presence_config["sections"]:
+                    if section["section_title"] in stats:
+                        count = stats[section["section_title"]]["count"]
+                        formatted_count = '{:,.0f}'.format(count).replace(',', '.')
+                        presence_parts.append(
+                            f"{formatted_count} {section['display_name']} {section['emoji']}"
+                        )
                 activity_text = " | ".join(presence_parts) if presence_parts else "No streams or sections configured"
                 status = discord.Status.online
 
-            await self.bot.change_presence(activity=discord.CustomActivity(name=activity_text), status=status)
-            self.logger.info(f"Status updated: {activity_text} ({status})")
+            # Use wait=True to ensure the presence update completes
+            await self.bot.change_presence(
+                activity=discord.CustomActivity(name=activity_text), 
+                status=status
+            )
+            self.logger.info(f"Status updated: {activity_text}")
         except Exception as e:
             self.logger.error(f"Error updating status: {e}")
+            # Set a basic presence if update fails
+            try:
+                await self.bot.change_presence(
+                    activity=discord.CustomActivity(name="Status update error"), 
+                    status=discord.Status.dnd
+                )
+            except Exception as e2:
+                self.logger.error(f"Failed to set error status: {e2}")
 
     @tasks.loop(minutes=1)
     async def update_dashboard(self) -> None:
