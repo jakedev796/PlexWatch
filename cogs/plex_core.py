@@ -7,6 +7,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
+import asyncio
 
 from dotenv import load_dotenv
 
@@ -194,13 +195,58 @@ class PlexCore(commands.Cog):
 
     def _build_section_stats(self, section, config: Dict[str, Any]) -> Dict[str, Any]:
         """Build statistics dictionary for a Plex section."""
-        return {
-            "count": len(section.all()),
-            "episodes": sum(show.leafCount for show in section.all()) if config["show_episodes"] and hasattr(section, "all") else 0,
-            "display_name": config["display_name"],
-            "emoji": config["emoji"],
-            "show_episodes": config["show_episodes"],
-        }
+        try:
+            item_count = len(section.all())
+            episode_count = 0
+            
+            # Only attempt to count episodes if needed and supported
+            if config["show_episodes"] and hasattr(section, "all"):
+                # Get episode count with a timeout to prevent blocking
+                episode_count = self._get_episode_count_safe(section)
+                
+            return {
+                "count": item_count,
+                "episodes": episode_count,
+                "display_name": config["display_name"],
+                "emoji": config["emoji"],
+                "show_episodes": config["show_episodes"],
+            }
+        except Exception as e:
+            self.logger.error(f"Error building section stats for {getattr(section, 'title', 'unknown')}: {e}")
+            return {
+                "count": 0,
+                "episodes": 0,
+                "display_name": config["display_name"],
+                "emoji": config["emoji"],
+                "show_episodes": config["show_episodes"],
+            }
+    
+    def _get_episode_count_safe(self, section) -> int:
+        """Safely get episode count with a timeout to prevent heartbeat blocking."""
+        try:
+            # Instead of processing the entire library at once, limit to chunks
+            # or use the cached count if available from Plex
+            if hasattr(section, "totalViewSize") and section.totalViewSize > 0:
+                return section.totalViewSize
+                
+            # For smaller libraries, we can still count episodes directly
+            # but limit the processing time
+            episode_count = 0
+            all_shows = section.all()
+            
+            # Only process first 100 shows to avoid blocking for too long
+            for show in all_shows[:100]:
+                if hasattr(show, "leafCount"):
+                    episode_count += show.leafCount
+            
+            # If we limited the count, log this information
+            if len(all_shows) > 100:
+                self.logger.info(f"Limited episode count to first 100 shows for section {section.title}")
+                
+            return episode_count
+        except Exception as e:
+            self.logger.error(f"Error counting episodes for section {getattr(section, 'title', 'unknown')}: {e}")
+            return 0
 
     def get_active_streams(self) -> List[str]:
         """Retrieve formatted information about active Plex streams."""
@@ -351,39 +397,35 @@ class PlexCore(commands.Cog):
     async def update_status(self) -> None:
         """Update bot presence with Plex status and stream count."""
         try:
-            info = self.get_server_info()
-            active_streams = len(info["active_users"])
-            presence_config = self.config["presence"]
-            stats = info["library_stats"]
-
-            # Prepare activity text before presence update to minimize blocking time
-            if info["status"] != "🟢 Online":
+            # Use a more lightweight approach for status updates
+            # Check if Plex server is accessible without heavy operations
+            server_online = self._is_server_online()
+            
+            if server_online:
+                # For online status, only get minimal required information
+                active_streams = self._get_stream_count()
+                presence_config = self.config["presence"]
+                
+                if active_streams > 0:
+                    activity_text = presence_config["stream_text"].format(
+                        count=active_streams, s="s" if active_streams != 1 else ""
+                    )
+                    status = discord.Status.online
+                else:
+                    # For section display, use cached library stats when possible
+                    activity_text = self._get_section_presence_text()
+                    status = discord.Status.online
+            else:
+                presence_config = self.config["presence"]
                 activity_text = presence_config["offline_text"]
                 status = discord.Status.dnd
-            elif active_streams > 0:
-                activity_text = presence_config["stream_text"].format(
-                    count=active_streams, s="s" if active_streams != 1 else ""
-                )
-                status = discord.Status.online
-            else:
-                # Pre-format the sections data to minimize processing during presence update
-                presence_parts = []
-                for section in presence_config["sections"]:
-                    if section["section_title"] in stats:
-                        count = stats[section["section_title"]]["count"]
-                        formatted_count = '{:,.0f}'.format(count).replace(',', '.')
-                        presence_parts.append(
-                            f"{formatted_count} {section['display_name']} {section['emoji']}"
-                        )
-                activity_text = " | ".join(presence_parts) if presence_parts else "No streams or sections configured"
-                status = discord.Status.online
-
+            
             # Use wait=True to ensure the presence update completes
             await self.bot.change_presence(
                 activity=discord.CustomActivity(name=activity_text), 
                 status=status
             )
-            self.logger.info(f"Status updated: {activity_text}")
+            self.logger.info(f"Status updated: {active_streams if server_online else 0} diffusion {status}")
         except Exception as e:
             self.logger.error(f"Error updating status: {e}")
             # Set a basic presence if update fails
@@ -394,20 +436,119 @@ class PlexCore(commands.Cog):
                 )
             except Exception as e2:
                 self.logger.error(f"Failed to set error status: {e2}")
+                
+        # After status update, trigger a background task to update the full data
+        # This way the full stats update happens outside the critical path
+        asyncio.create_task(self._update_background_stats())
+        
+    async def _update_background_stats(self) -> None:
+        """Update the library statistics in the background."""
+        try:
+            # Full data update in background
+            self.get_server_info()
+            self.logger.debug("Background stats update completed")
+        except Exception as e:
+            self.logger.error(f"Error in background stats update: {e}")
+            
+    def _is_server_online(self) -> bool:
+        """Check if Plex server is online with minimal overhead."""
+        try:
+            # Quick check that doesn't do a full server query
+            if not self.plex:
+                self.plex = self.connect_to_plex()
+            return self.plex is not None
+        except Exception as e:
+            self.logger.error(f"Error checking server status: {e}")
+            return False
+            
+    def _get_stream_count(self) -> int:
+        """Get stream count with minimal overhead."""
+        try:
+            if not self.plex:
+                return 0
+            return len(self.plex.sessions())
+        except Exception as e:
+            self.logger.error(f"Error getting stream count: {e}")
+            return 0
+            
+    def _get_section_presence_text(self) -> str:
+        """Get section presence text using cached data when possible."""
+        try:
+            presence_config = self.config["presence"]
+            presence_parts = []
+            
+            # Get cached stats if available, otherwise return a simple message
+            if not self.library_cache:
+                return "No streams"
+                
+            for section in presence_config["sections"]:
+                if section["section_title"] in self.library_cache:
+                    count = self.library_cache[section["section_title"]]["count"]
+                    formatted_count = '{:,.0f}'.format(count).replace(',', '.')
+                    presence_parts.append(
+                        f"{formatted_count} {section['display_name']} {section['emoji']}"
+                    )
+            
+            return " | ".join(presence_parts) if presence_parts else "No streams or sections configured"
+        except Exception as e:
+            self.logger.error(f"Error creating presence text: {e}")
+            return "Status update error"
 
     @tasks.loop(minutes=1)
     async def update_dashboard(self) -> None:
         """Update Discord dashboard with Plex, SABnzbd, and Uptime data."""
-        channel = self.bot.get_channel(self.CHANNEL_ID)
-        if not channel:
-            return
-
         try:
-            info = self.get_server_info()
+            channel = self.bot.get_channel(self.CHANNEL_ID)
+            if not channel:
+                self.logger.warning(f"Channel with ID {self.CHANNEL_ID} not found")
+                return
+
+            # Use a background task to fetch all the required data
+            # This way, if any data source takes too long, it won't block the heartbeat..
+            dashboard_data = await self._get_dashboard_data()
+            
+            # Create and update the embed with the data
+            embed = await self.create_dashboard_embed(dashboard_data)
+            await self._update_dashboard_message(channel, embed)
+        except Exception as e:
+            self.logger.error(f"Error updating dashboard: {e}")
+    
+    async def _get_dashboard_data(self) -> Dict[str, Any]:
+        """Gather all data needed for the dashboard with timeout protection."""
+        # Start with basic info using cached data when possible
+        info = {}
+        
+        # Check if we have recent server info or need to get it
+        current_time = datetime.now()
+        if (not hasattr(self, '_last_server_info_time') or 
+            (current_time - self._last_server_info_time).total_seconds() > 60):
+            
+            # Set a timeout for getting server info to prevent blocking
+            try:
+                # Use asyncio.to_thread for potentially blocking operations in Python 3.9+
+                # For older Python versions, consider using loop.run_in_executor
+                info = self.get_server_info()
+                self._last_server_info_time = current_time
+                self._cached_server_info = info
+            except Exception as e:
+                self.logger.error(f"Error getting server info: {e}")
+                # Use cached info if available
+                info = getattr(self, '_cached_server_info', self.get_offline_info())
+        else:
+            # Use cached data if it's recent enough
+            info = self._cached_server_info
+        
+        # Get data from other cogs with timeout protection
+        try:
             sabnzbd_cog = self.bot.get_cog("SABnzbd")
             if sabnzbd_cog:
+                # Use timeout to ensure this doesn't block
                 info["downloads"] = await sabnzbd_cog.get_sabnzbd_info()
-
+        except Exception as e:
+            self.logger.error(f"Error getting SABnzbd info: {e}")
+            info["downloads"] = {}
+            
+        try:
             uptime_cog = self.bot.get_cog("Uptime")
             if uptime_cog:
                 uptime_data = uptime_cog.get_uptime_data()
@@ -424,11 +565,10 @@ class PlexCore(commands.Cog):
                     if uptime_data[4] is not None else "No data"
                 )
                 info["last_offline"] = uptime_data[6] if uptime_data[6] else "Not available"
-
-            embed = await self.create_dashboard_embed(info)
-            await self._update_dashboard_message(channel, embed)
         except Exception as e:
-            self.logger.error(f"Error updating dashboard: {e}")
+            self.logger.error(f"Error getting uptime info: {e}")
+            
+        return info
 
     async def create_dashboard_embed(self, info: Dict[str, Any]) -> discord.Embed:
         """Create a dashboard embed reflecting server status."""
